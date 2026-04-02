@@ -197,6 +197,59 @@ Disable utilization collection when you want a faster inventory/security-only ru
 python3 oci_compute_audit.py --disable-utilization
 ```
 
+## Supported CLI arguments
+
+The script currently supports these arguments:
+
+- `--profile`  
+  OCI config profile to use when authenticating with the local `~/.oci/config` file.
+
+- `--region`  
+  Override the OCI region used for the audit. If omitted, the script uses the region from the active OCI config/profile.
+
+- `--region-list`  
+  Comma-separated list of regions to scan, such as `eu-frankfurt-1,uk-london-1`.
+
+- `--all-regions`  
+  Scan all subscribed regions in the tenancy instead of only the default or explicitly selected region.
+
+- `--compartment-id`  
+  Limit the audit to a single target compartment.
+
+- `--output-dir`  
+  Directory where the JSON, CSV, and HTML reports will be written. Default: current directory (`.`).
+
+- `--output-prefix`  
+  Prefix used for generated report filenames. Default: `oci_compute_health_check_audit`.
+
+- `--active-only`  
+  Restrict the audit to active-style lifecycle states such as running, starting, stopping, stopped, and provisioning.
+
+- `--include-terminated`  
+  Include terminated instances in the inventory and report output.
+
+- `--include-agent-plugins`  
+  Collect Oracle Cloud Agent plugin status information for each instance.
+
+- `--disable-utilization`  
+  Skip Monitoring-based utilization analysis and right-sizing recommendations. Useful for faster runs.
+
+- `--metrics-lookback-hours`  
+  Number of hours of Monitoring data to use for utilization analysis. Default: `24`.
+
+- `--disable-osmh`  
+  Skip OS Management Hub coverage checks.
+
+- `--disable-vss`  
+  Skip Vulnerability Scanning Service coverage checks.
+
+- `--policy-file`  
+  Path to a YAML or JSON policy file containing thresholds, required tag keys, and severity override rules.
+
+- `--verbose`  
+  Print more detailed progress and diagnostic information while the script runs.
+
+
 ## Output files
 
 The tool creates timestamped output such as:
