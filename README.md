@@ -1,8 +1,43 @@
 # OCI Compute Health Check Audit
 
-`oci_compute_health_check_audit` is a Cloud Shell-friendly Python project that audits OCI Compute deployments using the **OCI Python SDK**.
+`oci_compute_health_check_audit` is a Python project that audits OCI Compute deployments using the OCI Python SDK.
 
-It is designed to work directly from an unzipped project in **OCI Cloud Shell**, while still supporting editable installation as a package.
+It is designed to run well in **OCI Cloud Shell**, and it also works from a **local workstation** when standard OCI SDK config-file authentication is available.
+
+## Quick run examples
+
+### 1) Cloud Shell
+
+Cloud Shell is the easiest supported runtime because the OCI CLI and SDK environment are already present.
+
+```bash
+unzip oci_compute_health_check_audit_project.zip
+cd oci_compute_health_check_audit_project
+python3 -m pip install --user -r requirements.txt
+python3 oci_compute_audit.py --compartment-id <compartment_ocid>
+```
+
+### 2) Local workstation
+
+This works on Linux, macOS, or Windows with Python 3, the OCI SDK installed, and a valid `~/.oci/config`.
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 oci_compute_audit.py --profile DEFAULT --region eu-frankfurt-1 --compartment-id <compartment_ocid>
+```
+
+### 3) OCI compute instance using Instance Principals
+
+The **current CLI build in this project does not yet implement Instance Principal signer support**. Right now it uses OCI SDK config-file authentication, which is why Cloud Shell and local workstation execution are supported out of the box.
+
+Use this section as the intended run pattern once signer-based auth is added:
+
+```bash
+# Intended future pattern after adding signer support to the CLI
+python3 oci_compute_audit.py --auth instance_principal --region eu-frankfurt-1 --compartment-id <compartment_ocid>
+```
+
+Until that auth mode is added, run it on the OCI instance using a normal OCI config file or use Cloud Shell instead.
 
 ## Project naming
 
@@ -82,8 +117,6 @@ oci_compute_health_check_audit_project/
 
 ## Cloud Shell quick start
 
-Cloud Shell is the target environment.
-
 ```bash
 unzip oci_compute_health_check_audit_project.zip
 cd oci_compute_health_check_audit_project
@@ -104,7 +137,7 @@ oci-compute-health-check-audit
 
 ## Common usage
 
-Run in the current Cloud Shell region:
+Run in the current SDK config region:
 
 ```bash
 python3 oci_compute_audit.py
@@ -120,6 +153,12 @@ Run for a single compartment:
 
 ```bash
 python3 oci_compute_audit.py --compartment-id ocid1.compartment.oc1..example
+```
+
+Force a specific region:
+
+```bash
+python3 oci_compute_audit.py --region eu-frankfurt-1 --compartment-id ocid1.compartment.oc1..example
 ```
 
 Include Oracle Cloud Agent plugin checks:
@@ -150,32 +189,146 @@ oci_compute_health_check_audit_20260402_112500.csv
 oci_compute_health_check_audit_20260402_112500.html
 ```
 
-## Policy file structure
+## Policy file structure and explanations
 
-Example YAML:
+The policy file is optional. If you do not provide one, the tool uses built-in defaults.
+
+The policy has four top-level sections:
+
+### `thresholds`
+Numeric thresholds used by the audit engine.
+
+Supported keys in the current project:
+
+- `cpu_scale_up_pct`  
+  If average CPU is at or above this value, the instance is considered an `UPSCALE_CANDIDATE`.
+
+- `memory_scale_up_pct`  
+  If average memory is at or above this value, the instance is also considered an `UPSCALE_CANDIDATE`.
+
+- `cpu_scale_down_pct`  
+  If average CPU is at or below this value, it becomes eligible for `DOWNSCALE_CANDIDATE` review.
+
+- `memory_scale_down_pct`  
+  If average memory is at or below this value, it also becomes eligible for `DOWNSCALE_CANDIDATE` review.
+
+- `disk_iops_busy_threshold`  
+  A safety brake for downscale recommendations. If disk activity is above this threshold, the script avoids suggesting a downscale even when CPU and memory are low.
+
+- `network_bytes_busy_threshold`  
+  Another safety brake for downscale recommendations. If network traffic is above this threshold, the script avoids suggesting a downscale even when CPU and memory are low.
+
+- `world_open_admin_ports`  
+  List of admin ports that should not be open to the world. Used during NSG and security-list rule analysis.
+
+- `world_open_sensitive_ports`  
+  List of sensitive application or database ports that should not be open to the world.
+
+- `metrics_lookback_hours`  
+  Number of hours of Monitoring data used for average CPU, memory, disk, and network calculations.
+
+### `required_tag_keys`
+A list of tag keys expected on every instance.
+
+If one or more are missing, the script produces a `TAGS_MISSING` finding.
+
+Example:
 
 ```yaml
-thresholds:
-  cpu_scale_up_pct: 80
-  memory_scale_up_pct: 85
-  cpu_scale_down_pct: 12
-  memory_scale_down_pct: 30
-
 required_tag_keys:
   - owner
   - environment
   - application
   - cost_center
+```
 
+### `severity_overrides`
+A global severity map by finding code.
+
+This lets you change the default severity for a finding everywhere in the estate.
+
+Example:
+
+```yaml
 severity_overrides:
   PREEMPTIBLE_INSTANCE: low
   UTILIZATION_DOWNSCALE_CANDIDATE: medium
+```
 
+In that example:
+- every `PREEMPTIBLE_INSTANCE` finding becomes `low`
+- every `UTILIZATION_DOWNSCALE_CANDIDATE` finding becomes `medium`
+
+Supported severity values are:
+- `critical`
+- `high`
+- `medium`
+- `low`
+- `info`
+
+### `resource_overrides`
+Per-resource exception rules.
+
+These rules are evaluated after the global severity override.
+A rule only matches when all supplied filters match the current instance.
+
+Supported filters in the current project:
+- `finding_code`
+- `instance_name_regex`
+- `compartment_name_regex`
+- `shape_regex`
+- `region_regex`
+- `tag_equals`
+- `severity`
+
+Example:
+
+```yaml
 resource_overrides:
   - finding_code: PUBLIC_IP
     instance_name_regex: '^bastion-'
     severity: low
 ```
+
+That means:
+- if the finding code is `PUBLIC_IP`
+- and the instance name starts with `bastion-`
+- set severity to `low`
+
+Another example:
+
+```yaml
+resource_overrides:
+  - finding_code: PUBLIC_IP
+    tag_equals:
+      internet_facing_approved: 'true'
+    severity: low
+```
+
+That means:
+- if the finding code is `PUBLIC_IP`
+- and the instance has the tag `internet_facing_approved=true`
+- set severity to `low`
+
+## Policy evaluation order
+
+The final severity for a finding is decided in this order:
+
+1. built-in finding severity from the code
+2. matching `severity_overrides` entry, if present
+3. matching `resource_overrides` rule, if present
+
+So `resource_overrides` is the most specific and wins last.
+
+## Example policy file
+
+See the included example:
+
+```text
+policies/policy.example.yaml
+```
+
+That file now includes inline comments so it can be used as both a template and a reference guide.
 
 ## Notes and practical caveats
 
@@ -184,6 +337,7 @@ resource_overrides:
 - Some optional services may not be enabled or permitted in every tenancy. The script records best-effort findings and continues.
 - Security Zone, OS Management Hub, and Vulnerability Scanning checks are intentionally defensive. If the relevant service APIs are unavailable or restricted, the script degrades gracefully instead of failing the entire run.
 - The right-sizing logic is heuristic. Treat it as a shortlist for review, not as an automatic reshape decision engine.
+- Instance Principal authentication is not yet wired into the current CLI code path.
 
 ## Exit codes
 

@@ -1,32 +1,112 @@
+# Example policy file for oci_compute_health_check_audit
+#
+# This file is intentionally verbose and commented so it can act as both
+# a working policy example and a reference.
+#
+# How policy processing works:
+# 1) Built-in defaults are loaded first.
+# 2) Values in this file override those defaults.
+# 3) Finding severity is then adjusted in this order:
+#    a. the finding's built-in severity
+#    b. any global severity_overrides for that finding code
+#    c. any matching resource_overrides rule
+#
+# A threshold only influences recommendation logic and finding generation.
+# It does NOT resize or modify any OCI resource.
+
 thresholds:
+  # Average CPU percent at or above this value marks the instance as an
+  # UPSCALE_CANDIDATE.
   cpu_scale_up_pct: 80
+
+  # Average memory percent at or above this value also marks the instance as an
+  # UPSCALE_CANDIDATE.
   memory_scale_up_pct: 85
+
+  # Average CPU percent at or below this value is one of the conditions needed
+  # to mark the instance as a DOWNSCALE_CANDIDATE.
   cpu_scale_down_pct: 12
+
+  # Average memory percent at or below this value is another condition needed
+  # for a DOWNSCALE_CANDIDATE.
   memory_scale_down_pct: 30
+
+  # Average combined disk activity threshold used as a safety brake for
+  # downsizing recommendations. If disk IOPS is above this value, the script
+  # avoids recommending downscale even when CPU and memory look low.
   disk_iops_busy_threshold: 3000
+
+  # Average network bytes threshold used as a safety brake for downsizing.
+  # If network activity is above this value, the script avoids recommending
+  # downscale even when CPU and memory are low.
   network_bytes_busy_threshold: 50000000
-  world_open_admin_ports: [22, 3389]
-  world_open_sensitive_ports: [1521, 3306, 5432, 6379, 9200, 27017]
+
+  # Ports treated as world-open admin exposure if allowed from 0.0.0.0/0 or
+  # ::/0 in NSGs or security lists.
+  world_open_admin_ports:
+    - 22     # SSH
+    - 3389   # RDP
+
+  # Sensitive ports treated as risky when world-open.
+  world_open_sensitive_ports:
+    - 1521   # Oracle DB
+    - 3306   # MySQL
+    - 5432   # PostgreSQL
+    - 6379   # Redis
+    - 9200   # Elasticsearch / OpenSearch
+    - 27017  # MongoDB
+
+  # Monitoring lookback window, in hours, used for average CPU, memory,
+  # network, and disk calculations.
   metrics_lookback_hours: 24
 
+# Tags expected on every instance. Missing keys produce a TAGS_MISSING finding.
 required_tag_keys:
   - owner
   - environment
   - application
   - cost_center
 
+# Global finding severity remap.
+# Key = finding code.
+# Value = one of: critical, high, medium, low, info.
+#
+# Example: allow preemptible usage but keep it visible.
 severity_overrides:
   INSTANCE_POOL_MEMBER: info
   PREEMPTIBLE_INSTANCE: low
   UTILIZATION_DOWNSCALE_CANDIDATE: medium
 
+# Per-resource severity overrides.
+# Rules are evaluated top to bottom.
+# A rule matches only when all supplied filters match.
+# Supported filters in the current project:
+#   - finding_code
+#   - instance_name_regex
+#   - compartment_name_regex
+#   - shape_regex
+#   - region_regex
+#   - tag_equals
+#   - severity
 resource_overrides:
+  # Example: a bastion is expected to have a public IP, so lower severity.
   - finding_code: PUBLIC_IP
     instance_name_regex: '^bastion-'
     severity: low
+
+  # Example: keep world-open admin ports high in shared services.
   - finding_code: WORLD_OPEN_ADMIN_PORT
     compartment_name_regex: 'shared-services'
     severity: high
+
+  # Example: downgrade missing-tag findings for a known legacy VM family while
+  # a cleanup effort is in progress.
   - finding_code: TAGS_MISSING
-    shape_regex: '^VM\\.Standard'
+    shape_regex: '^VM\.Standard'
     severity: medium
+
+  # Example: only lower severity when a specific tag is present.
+  - finding_code: PUBLIC_IP
+    tag_equals:
+      internet_facing_approved: 'true'
+    severity: low
