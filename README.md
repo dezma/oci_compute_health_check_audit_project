@@ -6,38 +6,43 @@ It is designed to run well in **OCI Cloud Shell**, and it also works from a **lo
 
 ## Quick run examples
 
-### 1) Cloud Shell
+### 1) Local workstation using OCI config-file authentication
 
-Cloud Shell is the easiest supported runtime because the OCI CLI and SDK environment are already present.
+This works on Linux, macOS, or Windows with Python 3, the OCI SDK installed, and a valid `~/.oci/config`. Oracle documents config-file authentication as the standard SDK pattern for local execution.
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 oci_compute_audit.py --auth config --profile DEFAULT --region eu-frankfurt-1 --compartment-id <compartment_ocid>
+```
+
+### 2) OCI compute instance using Instance Principals
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 oci_compute_audit.py --auth instance_principal --region eu-frankfurt-1 --compartment-id <compartment_ocid>
+```
+
+If your SDK environment cannot infer the tenancy OCID from the signer, pass it explicitly:
+
+```bash
+python3 oci_compute_audit.py --auth instance_principal --region eu-frankfurt-1 --tenancy-id <tenancy_ocid> --compartment-id <compartment_ocid>
+```
+
+### 3) OCI Cloud Shell
+
+Cloud Shell remains the easiest runtime because the OCI CLI and Python SDK environment are already present and authenticated through the Cloud Shell session. Use normal config-style auth there unless you have a specific reason to test another mode.
 
 ```bash
 unzip oci_compute_health_check_audit_project.zip
 cd oci_compute_health_check_audit_project
 python3 -m pip install --user -r requirements.txt
-python3 oci_compute_audit.py --compartment-id <compartment_ocid>
+python3 oci_compute_audit.py --auth config --compartment-id <compartment_ocid>
 ```
 
-### 2) Local workstation
-
-This works on Linux, macOS, or Windows with Python 3, the OCI SDK installed, and a valid `~/.oci/config`.
-
-```bash
-python3 -m pip install -r requirements.txt
-python3 oci_compute_audit.py --profile DEFAULT --region eu-frankfurt-1 --compartment-id <compartment_ocid>
-```
-
-### 3) OCI compute instance using Instance Principals
-
-The **current CLI build in this project does not yet implement Instance Principal signer support**. Right now it uses OCI SDK config-file authentication, which is why Cloud Shell and local workstation execution are supported out of the box.
-
-Use this section as the intended run pattern once signer-based auth is added:
-
-```bash
-# Intended future pattern after adding signer support to the CLI
-python3 oci_compute_audit.py --auth instance_principal --region eu-frankfurt-1 --compartment-id <compartment_ocid>
-```
-
-Until that auth mode is added, run it on the OCI instance using a normal OCI config file or use Cloud Shell instead.
+Authentication mode summary:
+- `--auth config`: use `~/.oci/config` or the active Cloud Shell config/profile
+- `--auth instance_principal`: use native OCI instance principal authentication on a compute instance
+- if `--auth` is omitted, the tool defaults to `config` unless `OCI_CLI_AUTH=instance_principal` is set
 
 ## Project naming
 
@@ -140,7 +145,7 @@ oci-compute-health-check-audit
 Run in the current SDK config region:
 
 ```bash
-python3 oci_compute_audit.py
+python3 oci_compute_audit.py --auth config
 ```
 
 Run across all subscribed regions:
@@ -152,19 +157,32 @@ python3 oci_compute_audit.py --all-regions
 Run for a single compartment:
 
 ```bash
-python3 oci_compute_audit.py --compartment-id ocid1.compartment.oc1..example
+python3 oci_compute_audit.py --auth config --compartment-id ocid1.compartment.oc1..example
 ```
 
 Force a specific region:
 
 ```bash
-python3 oci_compute_audit.py --region eu-frankfurt-1 --compartment-id ocid1.compartment.oc1..example
+python3 oci_compute_audit.py --auth config --region eu-frankfurt-1 --compartment-id ocid1.compartment.oc1..example
 ```
 
 Include Oracle Cloud Agent plugin checks:
 
 ```bash
 python3 oci_compute_audit.py --include-agent-plugins
+```
+
+
+Use Instance Principals on an OCI compute instance:
+
+```bash
+python3 oci_compute_audit.py --auth instance_principal --region eu-frankfurt-1 --compartment-id ocid1.compartment.oc1..example
+```
+
+Use Instance Principals across all subscribed regions:
+
+```bash
+python3 oci_compute_audit.py --auth instance_principal --all-regions --compartment-id ocid1.compartment.oc1..example
 ```
 
 Use a policy file:

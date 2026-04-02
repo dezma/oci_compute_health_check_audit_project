@@ -242,10 +242,6 @@ class OciComputeHealthCheckAudit:
             )
         self.args = args
         self.policy = Policy.load(args.policy_file)
-        if getattr(args, "quick", False):
-            args.disable_utilization = True
-            args.disable_osmh = True
-            args.disable_vss = True
         self.base_config = self._load_config(args.profile, args.region)
         self.tenancy_id = self.base_config["tenancy"]
         self.home_region = self.base_config["region"]
@@ -265,10 +261,6 @@ class OciComputeHealthCheckAudit:
         self.security_zone_map: Dict[str, Dict[str, Any]] = {}
         self.region_context: Dict[str, Dict[str, Any]] = {}
 
-    def _log(self, message: str, *, force: bool = False) -> None:
-        if force or self.args.progress or self.args.verbose:
-            print(message, file=sys.stderr, flush=True)
-
     @staticmethod
     def _load_config(profile: Optional[str], region_override: Optional[str]) -> Dict[str, Any]:
         config_file = os.environ.get("OCI_CLI_CONFIG_FILE")
@@ -281,14 +273,8 @@ class OciComputeHealthCheckAudit:
             )
         except Exception as exc:
             raise AuditError(f"Unable to load OCI config using profile '{effective_profile}'.") from exc
-        effective_region = (
-            region_override
-            or os.environ.get("OCI_CLI_REGION")
-            or os.environ.get("OCI_REGION")
-            or cfg.get("region")
-        )
-        if effective_region:
-            cfg["region"] = effective_region
+        if region_override:
+            cfg["region"] = region_override
         return cfg
 
     def _resolve_regions(self) -> List[str]:
@@ -310,21 +296,7 @@ class OciComputeHealthCheckAudit:
                     name = self.identity_home.get_compartment(cid).data.name
             except Exception:
                 pass
-            compartments = [{"id": cid, "name": name}]
-            if self.args.compartment_subtree and cid != self.tenancy_id:
-                try:
-                    response = list_call_get_all_results(
-                        self.identity_home.list_compartments,
-                        cid,
-                        compartment_id_in_subtree=True,
-                        access_level="ACCESSIBLE",
-                    ).data
-                    for c in response:
-                        if getattr(c, "lifecycle_state", None) == "ACTIVE":
-                            compartments.append({"id": c.id, "name": c.name})
-                except Exception:
-                    pass
-            return compartments
+            return [{"id": cid, "name": name}]
 
         roots = [{"id": self.tenancy_id, "name": self.identity_home.get_tenancy(self.tenancy_id).data.name}]
         response = list_call_get_all_results(
@@ -339,10 +311,8 @@ class OciComputeHealthCheckAudit:
         return roots
 
     def run(self) -> Dict[str, Any]:
-        self._log(f"Starting audit. Regions={self.regions} compartments={len(self.compartments)}", force=True)
         self._prefetch_security_zones()
         for region in self.regions:
-            self._log(f"Building regional context for {region} ...", force=True)
             self.region_context[region] = self._build_region_context(region)
 
         rows: List[Dict[str, Any]] = []
@@ -354,7 +324,6 @@ class OciComputeHealthCheckAudit:
             for compartment in self.compartments:
                 try:
                     instances = list_call_get_all_results(compute.list_instances, compartment["id"]).data
-                    self._log(f"[{region}] {compartment['name']}: discovered {len(instances)} instances")
                 except Exception as exc:
                     errors.append(
                         {
@@ -366,14 +335,13 @@ class OciComputeHealthCheckAudit:
                     )
                     continue
 
-                for idx, instance_summary in enumerate(instances, start=1):
+                for instance_summary in instances:
                     state = safe_getattr(instance_summary, "lifecycle_state", default="UNKNOWN")
                     if self.args.active_only and state not in ACTIVE_STATES:
                         continue
                     if not self.args.include_terminated and state == "TERMINATED":
                         continue
                     try:
-                        self._log(f"[{region}] {compartment['name']}: auditing {idx}/{len(instances)} {getattr(instance_summary, 'display_name', instance_summary.id)}")
                         row, findings = self._audit_instance(region, compartment, instance_summary.id)
                         rows.append(row)
                         all_findings.extend([dict(item, instance_id=row["instance_id"], instance_name=row["instance_name"]) for item in findings])
@@ -391,14 +359,12 @@ class OciComputeHealthCheckAudit:
                         if self.args.verbose:
                             traceback.print_exc(file=sys.stderr)
 
-        scope_probe = self._probe_scope(rows, errors)
         report = {
             "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "project": "oci_compute_health_check_audit",
             "script": "oci_compute_audit.py",
             "config": {
                 "profile": self.args.profile or os.environ.get("OCI_CLI_PROFILE") or "DEFAULT",
-                "effective_region": self.base_config.get("region"),
                 "regions": self.regions,
                 "active_only": self.args.active_only,
                 "include_agent_plugins": self.args.include_agent_plugins,
@@ -407,40 +373,11 @@ class OciComputeHealthCheckAudit:
                 "policy_file": self.args.policy_file,
             },
             "summary": self._build_summary(rows, errors, all_findings),
-            "scope_probe": scope_probe,
             "instances": rows,
             "findings": all_findings,
             "errors": errors,
         }
         return report
-
-    def _probe_scope(self, rows: List[Dict[str, Any]], errors: List[Dict[str, Any]]) -> Dict[str, Any]:
-        probe: Dict[str, Any] = {
-            "effective_region": self.base_config.get("region"),
-            "requested_regions": list(self.regions),
-            "compartment_count": len(self.compartments),
-            "compartment_ids": [c["id"] for c in self.compartments],
-            "counts_by_region": {},
-        }
-        if rows or errors:
-            return probe
-        try:
-            regions = self.regions
-            if not self.args.all_regions:
-                subs = list_call_get_all_results(self.identity_home.list_region_subscriptions, self.tenancy_id).data
-                regions = sorted({r.region_name for r in subs if getattr(r, "status", "READY") == "READY"})
-            for region in regions:
-                compute = self.clients.get(region, "compute")
-                total = 0
-                for compartment in self.compartments:
-                    try:
-                        total += len(list_call_get_all_results(compute.list_instances, compartment["id"]).data)
-                    except Exception:
-                        continue
-                probe["counts_by_region"][region] = total
-        except Exception:
-            pass
-        return probe
 
     def _build_region_context(self, region: str) -> Dict[str, Any]:
         context = {
@@ -1170,16 +1107,42 @@ class OciComputeHealthCheckAudit:
 
 def render_html_report(report: Dict[str, Any]) -> str:
     summary = report["summary"]
-    instances = report["instances"]
-    findings = report["findings"]
-    errors = report["errors"]
+    findings = report.get("findings", [])
+    instances = report.get("instances", [])
+    errors = report.get("errors", [])
+    config = report.get("config", {})
+
+    def badge(label: str, kind: str) -> str:
+        return f"<span class='badge badge-{html.escape((kind or 'info').lower())}'>{html.escape(str(label))}</span>"
+
+    def metric_card(label: str, value: Any, hint: str = "") -> str:
+        hint_html = f"<div class='hint'>{html.escape(hint)}</div>" if hint else ""
+        return (
+            "<div class='metric'>"
+            f"<div class='label'>{html.escape(label)}</div>"
+            f"<div class='value'>{html.escape(str(value))}</div>"
+            f"{hint_html}"
+            "</div>"
+        )
+
+    def yes_no(value: Any) -> str:
+        return "Yes" if bool(value) else "No"
 
     top_codes = [[html.escape(k), str(v)] for k, v in summary.get("top_finding_codes", {}).items()]
-    sev_counts = [[html.escape(k), str(v)] for k, v in summary.get("severity_counts", {}).items()]
+    sev_counts = [[badge(k, k), str(v)] for k, v in summary.get("severity_counts", {}).items()]
     cap_counts = [[html.escape(k), str(v)] for k, v in summary.get("capacity_type_counts", {}).items()]
     util_counts = [[html.escape(k), str(v)] for k, v in summary.get("utilization_recommendation_counts", {}).items()]
+    config_rows = [
+        ["Profile", html.escape(str(config.get("profile", "")))],
+        ["Regions scanned", html.escape(", ".join(config.get("regions", []) or []))],
+        ["Active only", html.escape(yes_no(config.get("active_only")))],
+        ["Agent plugin checks", html.escape(yes_no(config.get("include_agent_plugins")))],
+        ["Utilization checks", html.escape(yes_no(config.get("include_utilization")))],
+        ["Metrics lookback (hours)", html.escape(str(config.get("metrics_lookback_hours", "")))],
+        ["Policy file", html.escape(str(config.get("policy_file") or "default policy"))],
+    ]
 
-    critical_rows = []
+    critical_rows: List[List[str]] = []
     for row in sorted(instances, key=lambda x: x.get("risk_score", 0), reverse=True)[:50]:
         critical_rows.append(
             [
@@ -1187,52 +1150,222 @@ def render_html_report(report: Dict[str, Any]) -> str:
                 html.escape(str(row.get("compartment_name", ""))),
                 html.escape(str(row.get("instance_name", ""))),
                 html.escape(str(row.get("shape", ""))),
-                html.escape(str(row.get("highest_severity", ""))),
+                badge(str(row.get("highest_severity", "none")), str(row.get("highest_severity", "info"))),
                 html.escape(str(row.get("risk_score", ""))),
+                html.escape(str(row.get("utilization_recommendation", ""))),
                 html.escape(", ".join(row.get("findings", [])[:6])),
             ]
         )
 
-    error_rows = [[html.escape(str(e.get("region", ""))), html.escape(str(e.get("instance_name", ""))), html.escape(str(e.get("error", "")))] for e in errors[:100]]
-    finding_rows = [[html.escape(str(f.get("severity", ""))), html.escape(str(f.get("code", ""))), html.escape(str(f.get("instance_name", ""))), html.escape(str(f.get("message", "")))] for f in findings[:200]]
+    finding_rows: List[List[str]] = []
+    for f in findings[:250]:
+        finding_rows.append(
+            [
+                badge(str(f.get("severity", "info")), str(f.get("severity", "info"))),
+                html.escape(str(f.get("category", ""))),
+                html.escape(str(f.get("code", ""))),
+                html.escape(str(f.get("instance_name", ""))),
+                html.escape(str(f.get("message", ""))),
+            ]
+        )
+
+    instance_rows: List[List[str]] = []
+    for row in sorted(instances, key=lambda x: (x.get("highest_severity", ""), x.get("risk_score", 0)), reverse=True)[:200]:
+        instance_rows.append(
+            [
+                html.escape(str(row.get("region", ""))),
+                html.escape(str(row.get("compartment_name", ""))),
+                html.escape(str(row.get("instance_name", ""))),
+                html.escape(str(row.get("state", ""))),
+                html.escape(str(row.get("shape", ""))),
+                html.escape(str(row.get("primary_private_ip", ""))),
+                html.escape(str(row.get("primary_public_ip", "")) if row.get("primary_public_ip") else "-"),
+                html.escape(str(row.get("security_zone_name", "")) if row.get("security_zone_name") else "-"),
+                html.escape(str(row.get("instance_pool_name", "")) if row.get("instance_pool_name") else "-"),
+                html.escape(str(row.get("cpu_avg_pct", "")) if row.get("cpu_avg_pct") is not None else "-"),
+                html.escape(str(row.get("memory_avg_pct", "")) if row.get("memory_avg_pct") is not None else "-"),
+                badge(str(row.get("highest_severity", "none")), str(row.get("highest_severity", "info"))),
+            ]
+        )
+
+    error_rows = [
+        [
+            html.escape(str(e.get("region", ""))),
+            html.escape(str(e.get("compartment_name", ""))),
+            html.escape(str(e.get("instance_name", ""))),
+            html.escape(str(e.get("error", ""))),
+        ]
+        for e in errors[:150]
+    ]
+
+    empty_hint = ""
+    if summary.get("instance_count", 0) == 0 and summary.get("error_count", 0) == 0:
+        empty_hint = (
+            "<div class='callout warning'>"
+            "<strong>No instances were audited.</strong> Check the selected region, compartment scope, and authentication context. "
+            "This usually means the script scanned the wrong scope rather than that the tenancy is empty."
+            "</div>"
+        )
 
     return f"""<!doctype html>
 <html lang='en'>
 <head>
 <meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>OCI Compute Health Check Audit</title>
 <style>
-body {{ font-family: Arial, Helvetica, sans-serif; margin: 24px; color: #1f2937; }}
-h1, h2 {{ margin-bottom: 8px; }}
-.card {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 16px; margin-bottom: 18px; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
-.metric {{ border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; background: #f9fafb; }}
-.metric .label {{ font-size: 12px; color: #6b7280; }}
-.metric .value {{ font-size: 24px; font-weight: 700; }}
-table {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
-th, td {{ border: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; font-size: 13px; }}
-th {{ background: #f3f4f6; }}
-.muted {{ color: #6b7280; }}
+:root {{
+  --bg: #f8fafc;
+  --card: #ffffff;
+  --line: #e5e7eb;
+  --text: #0f172a;
+  --muted: #64748b;
+  --thead: #f1f5f9;
+  --critical: #991b1b;
+  --critical-bg: #fee2e2;
+  --high: #9a3412;
+  --high-bg: #ffedd5;
+  --medium: #92400e;
+  --medium-bg: #fef3c7;
+  --low: #065f46;
+  --low-bg: #d1fae5;
+  --info: #1d4ed8;
+  --info-bg: #dbeafe;
+}}
+* {{ box-sizing: border-box; }}
+html {{ scroll-behavior: smooth; }}
+body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 Arial, Helvetica, sans-serif; }}
+.container {{ max-width: 1600px; margin: 0 auto; padding: 24px; }}
+h1, h2, h3 {{ margin: 0 0 10px; line-height: 1.2; }}
+p {{ margin: 0 0 10px; }}
+a {{ color: #1d4ed8; text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+.header {{ display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 18px; }}
+.header-meta {{ color: var(--muted); }}
+.nav {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 22px; }}
+.nav a {{ background: #e2e8f0; border-radius: 999px; padding: 7px 12px; font-size: 13px; }}
+.card {{ background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }}
+.metric {{ border: 1px solid var(--line); border-radius: 12px; padding: 14px; background: linear-gradient(180deg, #fff, #f8fafc); min-height: 94px; }}
+.metric .label {{ font-size: 12px; color: var(--muted); margin-bottom: 6px; }}
+.metric .value {{ font-size: 28px; font-weight: 700; word-break: break-word; }}
+.metric .hint {{ margin-top: 6px; color: var(--muted); font-size: 12px; }}
+.table-wrap {{ overflow: auto; border: 1px solid var(--line); border-radius: 12px; }}
+table {{ width: 100%; border-collapse: collapse; min-width: 760px; }}
+th, td {{ border-bottom: 1px solid var(--line); padding: 9px 10px; text-align: left; vertical-align: top; font-size: 13px; }}
+th {{ position: sticky; top: 0; background: var(--thead); z-index: 1; white-space: nowrap; }}
+tbody tr:nth-child(even) {{ background: #fbfdff; }}
+td {{ word-break: break-word; }}
+.muted {{ color: var(--muted); }}
+.badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; white-space: nowrap; }}
+.badge-critical {{ color: var(--critical); background: var(--critical-bg); }}
+.badge-high {{ color: var(--high); background: var(--high-bg); }}
+.badge-medium {{ color: var(--medium); background: var(--medium-bg); }}
+.badge-low {{ color: var(--low); background: var(--low-bg); }}
+.badge-info {{ color: var(--info); background: var(--info-bg); }}
+.two-col {{ display: grid; grid-template-columns: 1.2fr 1fr; gap: 18px; }}
+.callout {{ border-radius: 12px; padding: 12px 14px; margin-bottom: 16px; border: 1px solid var(--line); }}
+.callout.warning {{ background: #fff7ed; border-color: #fdba74; }}
+details summary {{ cursor: pointer; color: var(--muted); margin-bottom: 10px; }}
+.footer {{ color: var(--muted); font-size: 12px; margin-top: 10px; }}
+@media (max-width: 980px) {{
+  .two-col {{ grid-template-columns: 1fr; }}
+  .container {{ padding: 14px; }}
+  .metric .value {{ font-size: 24px; }}
+}}
+@media print {{
+  body {{ background: #fff; }}
+  .nav {{ display: none; }}
+  .card {{ box-shadow: none; break-inside: avoid; }}
+  th {{ position: static; }}
+}}
 </style>
 </head>
 <body>
-<h1>OCI Compute Health Check Audit</h1>
-<p class='muted'>Generated at {html.escape(report['generated_at_utc'])}</p>
-<div class='grid'>
-  <div class='metric'><div class='label'>Instances</div><div class='value'>{summary.get('instance_count', 0)}</div></div>
-  <div class='metric'><div class='label'>Errors</div><div class='value'>{summary.get('error_count', 0)}</div></div>
-  <div class='metric'><div class='label'>Public IP instances</div><div class='value'>{summary.get('public_ip_instance_count', 0)}</div></div>
-  <div class='metric'><div class='label'>Security zone instances</div><div class='value'>{summary.get('security_zone_instance_count', 0)}</div></div>
-  <div class='metric'><div class='label'>OSMH unmanaged</div><div class='value'>{summary.get('unmanaged_osmh_instance_count', 0)}</div></div>
-  <div class='metric'><div class='label'>VSS coverage missing</div><div class='value'>{summary.get('vss_missing_count', 0)}</div></div>
+<div class='container'>
+  <div class='header'>
+    <div>
+      <h1>OCI Compute Health Check Audit</h1>
+      <div class='header-meta'>Generated at {html.escape(report['generated_at_utc'])}</div>
+      <div class='header-meta'>Project: {html.escape(str(report.get('project', 'oci_compute_health_check_audit')))} · Script: {html.escape(str(report.get('script', 'oci_compute_audit.py')))}</div>
+    </div>
+    <div class='header-meta'>
+      <div>Instances audited: <strong>{summary.get('instance_count', 0)}</strong></div>
+      <div>Errors: <strong>{summary.get('error_count', 0)}</strong></div>
+    </div>
+  </div>
+
+  <div class='nav'>
+    <a href='#overview'>Overview</a>
+    <a href='#config'>Run config</a>
+    <a href='#risk'>Highest risk</a>
+    <a href='#findings'>Findings</a>
+    <a href='#instances'>Instances</a>
+    <a href='#errors'>Errors</a>
+  </div>
+
+  {empty_hint}
+
+  <section id='overview' class='card'>
+    <h2>Overview</h2>
+    <div class='grid'>
+      {metric_card('Instances', summary.get('instance_count', 0), 'Compute instances successfully audited')}
+      {metric_card('Errors', summary.get('error_count', 0), 'Audit exceptions recorded')}
+      {metric_card('Public IP instances', summary.get('public_ip_instance_count', 0), 'Primary VNIC has a public IP')}
+      {metric_card('Security zone instances', summary.get('security_zone_instance_count', 0), 'In or under a Security Zone compartment')}
+      {metric_card('OSMH unmanaged', summary.get('unmanaged_osmh_instance_count', 0), 'Not seen by OS Management Hub')}
+      {metric_card('VSS coverage missing', summary.get('vss_missing_count', 0), 'No vulnerability scanning target resolved')}
+    </div>
+  </section>
+
+  <div class='two-col'>
+    <section id='config' class='card'>
+      <h2>Run configuration</h2>
+      <div class='table-wrap'>{html_table(['Setting', 'Value'], config_rows)}</div>
+    </section>
+
+    <section class='card'>
+      <h2>Summary breakdowns</h2>
+      <h3>Severity counts</h3>
+      <div class='table-wrap'>{html_table(['Severity', 'Count'], sev_counts)}</div>
+      <h3 style='margin-top:14px;'>Top finding codes</h3>
+      <div class='table-wrap'>{html_table(['Finding code', 'Count'], top_codes)}</div>
+      <h3 style='margin-top:14px;'>Capacity types</h3>
+      <div class='table-wrap'>{html_table(['Capacity type', 'Count'], cap_counts)}</div>
+      <h3 style='margin-top:14px;'>Utilization recommendations</h3>
+      <div class='table-wrap'>{html_table(['Recommendation', 'Count'], util_counts)}</div>
+    </section>
+  </div>
+
+  <section id='risk' class='card'>
+    <h2>Highest-risk instances</h2>
+    <p class='muted'>Top 50 instances by computed risk score.</p>
+    <div class='table-wrap'>{html_table(['Region', 'Compartment', 'Instance', 'Shape', 'Highest severity', 'Risk score', 'Utilization', 'Top findings'], critical_rows)}</div>
+  </section>
+
+  <section id='findings' class='card'>
+    <h2>Findings sample</h2>
+    <p class='muted'>First 250 findings in report order. Use JSON output for the full structured dataset.</p>
+    <div class='table-wrap'>{html_table(['Severity', 'Category', 'Code', 'Instance', 'Message'], finding_rows)}</div>
+  </section>
+
+  <section id='instances' class='card'>
+    <h2>Instance summary</h2>
+    <p class='muted'>Top 200 instances sorted by severity and risk score.</p>
+    <div class='table-wrap'>{html_table(['Region', 'Compartment', 'Instance', 'State', 'Shape', 'Private IP', 'Public IP', 'Security Zone', 'Instance Pool', 'CPU avg %', 'Memory avg %', 'Highest severity'], instance_rows)}</div>
+    <details>
+      <summary>Why only a subset is shown here?</summary>
+      <p>The HTML report is meant to stay readable. The JSON and CSV outputs contain the complete audit result set.</p>
+    </details>
+  </section>
+
+  <section id='errors' class='card'>
+    <h2>Errors</h2>
+    <div class='table-wrap'>{html_table(['Region', 'Compartment', 'Instance', 'Error'], error_rows)}</div>
+  </section>
+
+  <div class='footer'>Generated by oci_compute_health_check_audit. For full fidelity and machine-readable details, review the accompanying JSON output.</div>
 </div>
-<div class='card'><h2>Severity counts</h2>{html_table(['Severity','Count'], sev_counts)}</div>
-<div class='card'><h2>Top finding codes</h2>{html_table(['Finding code','Count'], top_codes)}</div>
-<div class='card'><h2>Capacity types</h2>{html_table(['Capacity type','Count'], cap_counts)}</div>
-<div class='card'><h2>Utilization recommendations</h2>{html_table(['Recommendation','Count'], util_counts)}</div>
-<div class='card'><h2>Highest-risk instances</h2>{html_table(['Region','Compartment','Instance','Shape','Highest severity','Risk score','Top findings'], critical_rows)}</div>
-<div class='card'><h2>Findings sample</h2>{html_table(['Severity','Code','Instance','Message'], finding_rows)}</div>
-<div class='card'><h2>Errors</h2>{html_table(['Region','Instance','Error'], error_rows)}</div>
 </body>
 </html>
 """
@@ -1304,8 +1437,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--region-list", help="Comma-separated region names.")
     p.add_argument("--all-regions", action="store_true")
     p.add_argument("--compartment-id")
-    p.add_argument("--compartment-subtree", action="store_true", default=True, help="When --compartment-id is set, include active child compartments under that compartment.")
-    p.add_argument("--direct-compartment-only", action="store_true", help="Audit only the exact compartment passed in --compartment-id.")
     p.add_argument("--output-dir", default=".")
     p.add_argument("--output-prefix", default="oci_compute_health_check_audit")
     p.add_argument("--active-only", action="store_true")
@@ -1315,8 +1446,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--metrics-lookback-hours", type=int, default=24)
     p.add_argument("--disable-osmh", action="store_true")
     p.add_argument("--disable-vss", action="store_true")
-    p.add_argument("--quick", action="store_true", help="Fast mode: disables utilization, OSMH, and VSS checks.")
-    p.add_argument("--progress", action="store_true", help="Print progress messages during collection.")
     p.add_argument("--policy-file", help="YAML or JSON file with severity overrides and thresholds.")
     p.add_argument("--verbose", action="store_true")
     return p
@@ -1325,26 +1454,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.direct_compartment_only:
-        args.compartment_subtree = False
     try:
         audit = OciComputeHealthCheckAudit(args)
         report = audit.run()
         paths = write_outputs(report, Path(args.output_dir), args.output_prefix)
         summary = report["summary"]
         print("=== OCI Compute Health Check Audit ===")
-        print(f"Profile           : {report['config']['profile']}")
-        print(f"Effective region  : {report['config'].get('effective_region')}")
-        print(f"Regions scanned   : {', '.join(report['config']['regions'])}")
         print(f"Instances audited : {summary['instance_count']}")
         print(f"Errors            : {summary['error_count']}")
-        if summary['instance_count'] == 0 and summary['error_count'] == 0:
-            probe = report.get('scope_probe', {})
-            counts = probe.get('counts_by_region', {}) or {}
-            if counts:
-                nonzero = {k: v for k, v in counts.items() if v}
-                print(f"Scope probe       : {nonzero or counts}")
-            print("Hint              : No instances were audited in the selected execution scope. Try --region <expected-region> or --all-regions.")
         print(f"Severity counts   : {summary['severity_counts']}")
         print(f"Output JSON       : {paths['json']}")
         print(f"Output CSV        : {paths['csv']}")
@@ -1354,12 +1471,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Interrupted.", file=sys.stderr)
         return 130
     except AuditError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    except Exception as exc:
-        print(f"UNHANDLED ERROR: {exc}", file=sys.stderr, flush=True)
-        traceback.print_exc(file=sys.stderr)
-        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover
