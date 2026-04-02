@@ -1,0 +1,32 @@
+thresholds:
+  cpu_scale_up_pct: 80
+  memory_scale_up_pct: 85
+  cpu_scale_down_pct: 12
+  memory_scale_down_pct: 30
+  disk_iops_busy_threshold: 3000
+  network_bytes_busy_threshold: 50000000
+  world_open_admin_ports: [22, 3389]
+  world_open_sensitive_ports: [1521, 3306, 5432, 6379, 9200, 27017]
+  metrics_lookback_hours: 24
+
+required_tag_keys:
+  - owner
+  - environment
+  - application
+  - cost_center
+
+severity_overrides:
+  INSTANCE_POOL_MEMBER: info
+  PREEMPTIBLE_INSTANCE: low
+  UTILIZATION_DOWNSCALE_CANDIDATE: medium
+
+resource_overrides:
+  - finding_code: PUBLIC_IP
+    instance_name_regex: '^bastion-'
+    severity: low
+  - finding_code: WORLD_OPEN_ADMIN_PORT
+    compartment_name_regex: 'shared-services'
+    severity: high
+  - finding_code: TAGS_MISSING
+    shape_regex: '^VM\\.Standard'
+    severity: medium

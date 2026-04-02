@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oci-compute-health-check-audit"
+version = "0.2.0"
+description = "Production-oriented OCI compute health check and audit tool for OCI Cloud Shell"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "OpenAI" }]
+license = { text = "Proprietary" }
+dependencies = [
+  "oci>=2.126.0",
+  "PyYAML>=6.0"
+]
+keywords = ["oci", "oracle cloud", "compute", "audit", "cloud shell", "security"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Operating System :: OS Independent"
+]
+
+[project.scripts]
+oci-compute-health-check-audit = "oci_compute_health_check_audit.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
