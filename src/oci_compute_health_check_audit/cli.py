@@ -9,6 +9,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import traceback
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -33,6 +35,7 @@ DEFAULT_RETRY = getattr(getattr(oci, "retry", None), "DEFAULT_RETRY_STRATEGY", N
 ACTIVE_STATES = {"RUNNING", "PROVISIONING", "STARTING", "STOPPING", "STOPPED", "ACTIVE"}
 SEVERITY_SCORE = {"critical": 40, "high": 20, "medium": 8, "low": 3, "info": 1}
 DEFAULT_TAG_KEYS = ["owner", "environment", "application", "cost_center"]
+PROGRESS_HEARTBEAT_SECONDS = 15
 DEFAULT_POLICY = {
     "thresholds": {
         "cpu_scale_up_pct": 80.0,
@@ -251,7 +254,7 @@ class OciComputeHealthCheckAudit:
         self.compartments = self._resolve_compartments()
         self.compartment_name_by_id = {c["id"]: c["name"] for c in self.compartments}
 
-        self.image_cache: Dict[Tuple[str, str], str] = {}
+        self.image_cache: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
         self.subnet_cache: Dict[Tuple[str, str], Any] = {}
         self.vnic_cache: Dict[Tuple[str, str], Any] = {}
         self.nsg_rules_cache: Dict[Tuple[str, str], List[Any]] = {}
@@ -260,6 +263,38 @@ class OciComputeHealthCheckAudit:
         self.block_backup_cache: Dict[Tuple[str, str], Optional[str]] = {}
         self.security_zone_map: Dict[str, Dict[str, Any]] = {}
         self.region_context: Dict[str, Dict[str, Any]] = {}
+        self.progress_enabled = not getattr(args, "quiet_progress", False)
+
+    def _progress(self, message: str) -> None:
+        if not self.progress_enabled:
+            return
+        stamp = dt.datetime.now().strftime("%H:%M:%S")
+        print(f"[{stamp}] {message}", file=sys.stderr, flush=True)
+
+    def _call_with_progress(self, description: str, func, *args, **kwargs):
+        self._progress(f"START {description}")
+        started = dt.datetime.now()
+        stop_event = threading.Event()
+
+        def heartbeat() -> None:
+            while not stop_event.wait(PROGRESS_HEARTBEAT_SECONDS):
+                elapsed = (dt.datetime.now() - started).total_seconds()
+                self._progress(f"WAIT  {description} still running ({elapsed:.1f}s)")
+
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
+        try:
+            result = func(*args, **kwargs)
+            elapsed = (dt.datetime.now() - started).total_seconds()
+            self._progress(f"DONE  {description} ({elapsed:.1f}s)")
+            return result
+        except Exception:
+            elapsed = (dt.datetime.now() - started).total_seconds()
+            self._progress(f"FAIL  {description} ({elapsed:.1f}s)")
+            raise
+        finally:
+            stop_event.set()
+            thread.join(timeout=0.2)
 
     @staticmethod
     def _load_config(profile: Optional[str], region_override: Optional[str]) -> Dict[str, Any]:
@@ -288,15 +323,40 @@ class OciComputeHealthCheckAudit:
     def _resolve_compartments(self) -> List[Dict[str, str]]:
         if self.args.compartment_id:
             cid = self.args.compartment_id
-            name = cid
+            selected: List[Dict[str, str]] = []
             try:
                 if cid == self.tenancy_id:
-                    name = self.identity_home.get_tenancy(cid).data.name
+                    selected.append({"id": cid, "name": self.identity_home.get_tenancy(cid).data.name})
                 else:
-                    name = self.identity_home.get_compartment(cid).data.name
+                    selected.append({"id": cid, "name": self.identity_home.get_compartment(cid).data.name})
             except Exception:
-                pass
-            return [{"id": cid, "name": name}]
+                selected.append({"id": cid, "name": cid})
+
+            if self.args.direct_compartment_only or cid == self.tenancy_id:
+                return selected
+
+            try:
+                response = list_call_get_all_results(
+                    self.identity_home.list_compartments,
+                    cid,
+                    compartment_id_in_subtree=True,
+                    access_level="ACCESSIBLE",
+                ).data
+            except Exception:
+                return selected
+
+            for c in response:
+                if getattr(c, "lifecycle_state", None) == "ACTIVE":
+                    selected.append({"id": c.id, "name": c.name})
+            # de-duplicate while preserving order
+            seen = set()
+            deduped: List[Dict[str, str]] = []
+            for item in selected:
+                if item["id"] in seen:
+                    continue
+                seen.add(item["id"])
+                deduped.append(item)
+            return deduped
 
         roots = [{"id": self.tenancy_id, "name": self.identity_home.get_tenancy(self.tenancy_id).data.name}]
         response = list_call_get_all_results(
@@ -311,8 +371,10 @@ class OciComputeHealthCheckAudit:
         return roots
 
     def run(self) -> Dict[str, Any]:
+        self._progress(f"Audit starting for {len(self.regions)} region(s) and {len(self.compartments)} compartment target(s)")
         self._prefetch_security_zones()
         for region in self.regions:
+            self._progress(f"Preparing region context for {region}")
             self.region_context[region] = self._build_region_context(region)
 
         rows: List[Dict[str, Any]] = []
@@ -323,7 +385,12 @@ class OciComputeHealthCheckAudit:
             compute = self.clients.get(region, "compute")
             for compartment in self.compartments:
                 try:
-                    instances = list_call_get_all_results(compute.list_instances, compartment["id"]).data
+                    instances = self._call_with_progress(
+                        f"list instances region={region} compartment={compartment['name']}",
+                        list_call_get_all_results,
+                        compute.list_instances,
+                        compartment["id"],
+                    ).data
                 except Exception as exc:
                     errors.append(
                         {
@@ -335,6 +402,7 @@ class OciComputeHealthCheckAudit:
                     )
                     continue
 
+                self._progress(f"Discovered {len(instances)} instance(s) in region={region} compartment={compartment['name']}")
                 for instance_summary in instances:
                     state = safe_getattr(instance_summary, "lifecycle_state", default="UNKNOWN")
                     if self.args.active_only and state not in ACTIVE_STATES:
@@ -342,6 +410,7 @@ class OciComputeHealthCheckAudit:
                     if not self.args.include_terminated and state == "TERMINATED":
                         continue
                     try:
+                        self._progress(f"Auditing instance {getattr(instance_summary, 'display_name', instance_summary.id)} in {region}")
                         row, findings = self._audit_instance(region, compartment, instance_summary.id)
                         rows.append(row)
                         all_findings.extend([dict(item, instance_id=row["instance_id"], instance_name=row["instance_name"]) for item in findings])
@@ -428,7 +497,7 @@ class OciComputeHealthCheckAudit:
             return
         for comp in self.compartments:
             try:
-                pools = list_call_get_all_results(mgmt.list_instance_pools, comp["id"]).data
+                pools = self._call_with_progress(f"list instance pools region={region} compartment={comp['name']}", list_call_get_all_results, mgmt.list_instance_pools, comp["id"]).data
             except Exception:
                 continue
             for pool in pools:
@@ -462,7 +531,7 @@ class OciComputeHealthCheckAudit:
             return
         for comp in self.compartments:
             try:
-                configs = list_call_get_all_results(list_fn, comp["id"]).data
+                configs = self._call_with_progress(f"list autoscaling configs region={region} compartment={comp['name']}", list_call_get_all_results, list_fn, comp["id"]).data
             except Exception:
                 continue
             for cfg in configs:
@@ -483,7 +552,7 @@ class OciComputeHealthCheckAudit:
             return
         for comp in self.compartments:
             try:
-                reservations = list_call_get_all_results(list_fn, comp["id"]).data
+                reservations = self._call_with_progress(f"list capacity reservations region={region} compartment={comp['name']}", list_call_get_all_results, list_fn, comp["id"]).data
             except Exception:
                 continue
             for res in reservations:
@@ -508,7 +577,7 @@ class OciComputeHealthCheckAudit:
             return
         for comp in self.compartments:
             try:
-                items = list_call_get_all_results(list_fn, comp["id"]).data
+                items = self._call_with_progress(f"list OSMH managed instances region={region} compartment={comp['name']}", list_call_get_all_results, list_fn, comp["id"]).data
             except Exception:
                 continue
             for item in items:
@@ -535,7 +604,7 @@ class OciComputeHealthCheckAudit:
             return
         for comp in self.compartments:
             try:
-                items = list_call_get_all_results(list_fn, comp["id"]).data
+                items = self._call_with_progress(f"list VSS host scan targets region={region} compartment={comp['name']}", list_call_get_all_results, list_fn, comp["id"]).data
             except Exception:
                 continue
             context["vss_targets_by_compartment"][comp["id"]].extend(model_to_dict(x) for x in items)
@@ -544,8 +613,10 @@ class OciComputeHealthCheckAudit:
         compute = self.clients.get(region, "compute")
         network = self.clients.get(region, "network")
         block = self.clients.get(region, "block")
-        instance = compute.get_instance(instance_id).data
+        instance = self._call_with_progress(f"get instance {instance_id} region={region}", compute.get_instance, instance_id).data
         state = safe_getattr(instance, "lifecycle_state", default="UNKNOWN")
+
+        image_details = self._get_image_details(region, safe_getattr(instance, "image_id"))
 
         row: Dict[str, Any] = {
             "region": region,
@@ -560,7 +631,9 @@ class OciComputeHealthCheckAudit:
             "shape_ocpus": safe_getattr(safe_getattr(instance, "shape_config", default=None), "ocpus"),
             "shape_memory_gbs": safe_getattr(safe_getattr(instance, "shape_config", default=None), "memory_in_gbs"),
             "image_id": safe_getattr(instance, "image_id"),
-            "image_name": self._get_image_name(region, safe_getattr(instance, "image_id")),
+            "image_name": image_details.get("name"),
+            "image_operating_system": image_details.get("operating_system"),
+            "image_type": image_details.get("image_type"),
             "capacity_type": self._resolve_capacity_type(instance),
             "is_preemptible": self._is_preemptible(instance),
             "capacity_reservation_id": safe_getattr(instance, "capacity_reservation_id"),
@@ -694,17 +767,38 @@ class OciComputeHealthCheckAudit:
             self.subnet_cache[key] = network.get_subnet(subnet_id).data
         return self.subnet_cache[key]
 
-    def _get_image_name(self, region: str, image_id: Optional[str]) -> Optional[str]:
-        if not image_id:
+    @staticmethod
+    def _normalize_image_type(operating_system: Optional[str]) -> Optional[str]:
+        if not operating_system:
             return None
+        os_name = str(operating_system).strip().lower()
+        if "windows" in os_name:
+            return "windows"
+        linux_markers = ("linux", "ubuntu", "centos", "debian", "oracle", "red hat", "rhel", "suse", "rocky", "alma")
+        if any(marker in os_name for marker in linux_markers):
+            return "linux"
+        return operating_system
+
+    def _get_image_details(self, region: str, image_id: Optional[str]) -> Dict[str, Optional[str]]:
+        if not image_id:
+            return {"name": None, "operating_system": None, "image_type": None}
         key = (region, image_id)
         if key not in self.image_cache:
             compute = self.clients.get(region, "compute")
             try:
-                self.image_cache[key] = compute.get_image(image_id).data.display_name
+                image = self._call_with_progress(f"get image {image_id} region={region}", compute.get_image, image_id).data
+                operating_system = safe_getattr(image, "operating_system")
+                self.image_cache[key] = {
+                    "name": safe_getattr(image, "display_name", default=image_id),
+                    "operating_system": operating_system,
+                    "image_type": self._normalize_image_type(operating_system),
+                }
             except Exception:
-                self.image_cache[key] = image_id
+                self.image_cache[key] = {"name": image_id, "operating_system": None, "image_type": None}
         return self.image_cache[key]
+
+    def _get_image_name(self, region: str, image_id: Optional[str]) -> Optional[str]:
+        return self._get_image_details(region, image_id).get("name")
 
     def _get_boot_volume_info(self, region: str, compartment_id: str, instance: Any) -> Dict[str, Any]:
         block = self.clients.get(region, "block")
@@ -854,6 +948,7 @@ class OciComputeHealthCheckAudit:
         }
 
     def _get_utilization(self, region: str, compartment_id: str, instance_id: str) -> Dict[str, Any]:
+        self._progress(f"Collecting utilization metrics for instance {instance_id} in {region}")
         out = self._empty_utilization()
         monitoring = self.clients.get(region, "monitoring")
         details_cls = oci.monitoring.models.SummarizeMetricsDataDetails
@@ -885,6 +980,7 @@ class OciComputeHealthCheckAudit:
             except Exception:
                 out[key] = None
         out.update(self._recommend_shape_action(out))
+        self._progress(f"Finished utilization metrics for instance {instance_id} in {region}")
         return out
 
     @staticmethod
@@ -1091,12 +1187,14 @@ class OciComputeHealthCheckAudit:
         code_counts = Counter(f["code"] for f in findings)
         capacity_counts = Counter(r.get("capacity_type") for r in rows)
         utilization_counts = Counter(r.get("utilization_recommendation") for r in rows)
+        image_type_counts = Counter(r.get("image_type") or "unknown" for r in rows)
         return {
             "instance_count": len(rows),
             "error_count": len(errors),
             "severity_counts": dict(severity_counts),
             "top_finding_codes": dict(code_counts.most_common(15)),
             "capacity_type_counts": dict(capacity_counts),
+            "image_type_counts": dict(image_type_counts),
             "utilization_recommendation_counts": dict(utilization_counts),
             "security_zone_instance_count": sum(1 for r in rows if r.get("security_zone_name")),
             "public_ip_instance_count": sum(1 for r in rows if r.get("primary_public_ip")),
@@ -1107,42 +1205,17 @@ class OciComputeHealthCheckAudit:
 
 def render_html_report(report: Dict[str, Any]) -> str:
     summary = report["summary"]
-    findings = report.get("findings", [])
-    instances = report.get("instances", [])
-    errors = report.get("errors", [])
-    config = report.get("config", {})
-
-    def badge(label: str, kind: str) -> str:
-        return f"<span class='badge badge-{html.escape((kind or 'info').lower())}'>{html.escape(str(label))}</span>"
-
-    def metric_card(label: str, value: Any, hint: str = "") -> str:
-        hint_html = f"<div class='hint'>{html.escape(hint)}</div>" if hint else ""
-        return (
-            "<div class='metric'>"
-            f"<div class='label'>{html.escape(label)}</div>"
-            f"<div class='value'>{html.escape(str(value))}</div>"
-            f"{hint_html}"
-            "</div>"
-        )
-
-    def yes_no(value: Any) -> str:
-        return "Yes" if bool(value) else "No"
+    instances = report["instances"]
+    findings = report["findings"]
+    errors = report["errors"]
 
     top_codes = [[html.escape(k), str(v)] for k, v in summary.get("top_finding_codes", {}).items()]
-    sev_counts = [[badge(k, k), str(v)] for k, v in summary.get("severity_counts", {}).items()]
+    sev_counts = [[html.escape(k), str(v)] for k, v in summary.get("severity_counts", {}).items()]
     cap_counts = [[html.escape(k), str(v)] for k, v in summary.get("capacity_type_counts", {}).items()]
+    image_counts = [[html.escape(k), str(v)] for k, v in summary.get("image_type_counts", {}).items()]
     util_counts = [[html.escape(k), str(v)] for k, v in summary.get("utilization_recommendation_counts", {}).items()]
-    config_rows = [
-        ["Profile", html.escape(str(config.get("profile", "")))],
-        ["Regions scanned", html.escape(", ".join(config.get("regions", []) or []))],
-        ["Active only", html.escape(yes_no(config.get("active_only")))],
-        ["Agent plugin checks", html.escape(yes_no(config.get("include_agent_plugins")))],
-        ["Utilization checks", html.escape(yes_no(config.get("include_utilization")))],
-        ["Metrics lookback (hours)", html.escape(str(config.get("metrics_lookback_hours", "")))],
-        ["Policy file", html.escape(str(config.get("policy_file") or "default policy"))],
-    ]
 
-    critical_rows: List[List[str]] = []
+    critical_rows = []
     for row in sorted(instances, key=lambda x: x.get("risk_score", 0), reverse=True)[:50]:
         critical_rows.append(
             [
@@ -1150,222 +1223,54 @@ def render_html_report(report: Dict[str, Any]) -> str:
                 html.escape(str(row.get("compartment_name", ""))),
                 html.escape(str(row.get("instance_name", ""))),
                 html.escape(str(row.get("shape", ""))),
-                badge(str(row.get("highest_severity", "none")), str(row.get("highest_severity", "info"))),
+                html.escape(str(row.get("highest_severity", ""))),
                 html.escape(str(row.get("risk_score", ""))),
-                html.escape(str(row.get("utilization_recommendation", ""))),
                 html.escape(", ".join(row.get("findings", [])[:6])),
             ]
         )
 
-    finding_rows: List[List[str]] = []
-    for f in findings[:250]:
-        finding_rows.append(
-            [
-                badge(str(f.get("severity", "info")), str(f.get("severity", "info"))),
-                html.escape(str(f.get("category", ""))),
-                html.escape(str(f.get("code", ""))),
-                html.escape(str(f.get("instance_name", ""))),
-                html.escape(str(f.get("message", ""))),
-            ]
-        )
-
-    instance_rows: List[List[str]] = []
-    for row in sorted(instances, key=lambda x: (x.get("highest_severity", ""), x.get("risk_score", 0)), reverse=True)[:200]:
-        instance_rows.append(
-            [
-                html.escape(str(row.get("region", ""))),
-                html.escape(str(row.get("compartment_name", ""))),
-                html.escape(str(row.get("instance_name", ""))),
-                html.escape(str(row.get("state", ""))),
-                html.escape(str(row.get("shape", ""))),
-                html.escape(str(row.get("primary_private_ip", ""))),
-                html.escape(str(row.get("primary_public_ip", "")) if row.get("primary_public_ip") else "-"),
-                html.escape(str(row.get("security_zone_name", "")) if row.get("security_zone_name") else "-"),
-                html.escape(str(row.get("instance_pool_name", "")) if row.get("instance_pool_name") else "-"),
-                html.escape(str(row.get("cpu_avg_pct", "")) if row.get("cpu_avg_pct") is not None else "-"),
-                html.escape(str(row.get("memory_avg_pct", "")) if row.get("memory_avg_pct") is not None else "-"),
-                badge(str(row.get("highest_severity", "none")), str(row.get("highest_severity", "info"))),
-            ]
-        )
-
-    error_rows = [
-        [
-            html.escape(str(e.get("region", ""))),
-            html.escape(str(e.get("compartment_name", ""))),
-            html.escape(str(e.get("instance_name", ""))),
-            html.escape(str(e.get("error", ""))),
-        ]
-        for e in errors[:150]
-    ]
-
-    empty_hint = ""
-    if summary.get("instance_count", 0) == 0 and summary.get("error_count", 0) == 0:
-        empty_hint = (
-            "<div class='callout warning'>"
-            "<strong>No instances were audited.</strong> Check the selected region, compartment scope, and authentication context. "
-            "This usually means the script scanned the wrong scope rather than that the tenancy is empty."
-            "</div>"
-        )
+    error_rows = [[html.escape(str(e.get("region", ""))), html.escape(str(e.get("instance_name", ""))), html.escape(str(e.get("error", "")))] for e in errors[:100]]
+    finding_rows = [[html.escape(str(f.get("severity", ""))), html.escape(str(f.get("code", ""))), html.escape(str(f.get("instance_name", ""))), html.escape(str(f.get("message", "")))] for f in findings[:200]]
 
     return f"""<!doctype html>
 <html lang='en'>
 <head>
 <meta charset='utf-8'>
-<meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>OCI Compute Health Check Audit</title>
 <style>
-:root {{
-  --bg: #f8fafc;
-  --card: #ffffff;
-  --line: #e5e7eb;
-  --text: #0f172a;
-  --muted: #64748b;
-  --thead: #f1f5f9;
-  --critical: #991b1b;
-  --critical-bg: #fee2e2;
-  --high: #9a3412;
-  --high-bg: #ffedd5;
-  --medium: #92400e;
-  --medium-bg: #fef3c7;
-  --low: #065f46;
-  --low-bg: #d1fae5;
-  --info: #1d4ed8;
-  --info-bg: #dbeafe;
-}}
-* {{ box-sizing: border-box; }}
-html {{ scroll-behavior: smooth; }}
-body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 Arial, Helvetica, sans-serif; }}
-.container {{ max-width: 1600px; margin: 0 auto; padding: 24px; }}
-h1, h2, h3 {{ margin: 0 0 10px; line-height: 1.2; }}
-p {{ margin: 0 0 10px; }}
-a {{ color: #1d4ed8; text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
-.header {{ display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 18px; }}
-.header-meta {{ color: var(--muted); }}
-.nav {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 22px; }}
-.nav a {{ background: #e2e8f0; border-radius: 999px; padding: 7px 12px; font-size: 13px; }}
-.card {{ background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 18px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }}
-.metric {{ border: 1px solid var(--line); border-radius: 12px; padding: 14px; background: linear-gradient(180deg, #fff, #f8fafc); min-height: 94px; }}
-.metric .label {{ font-size: 12px; color: var(--muted); margin-bottom: 6px; }}
-.metric .value {{ font-size: 28px; font-weight: 700; word-break: break-word; }}
-.metric .hint {{ margin-top: 6px; color: var(--muted); font-size: 12px; }}
-.table-wrap {{ overflow: auto; border: 1px solid var(--line); border-radius: 12px; }}
-table {{ width: 100%; border-collapse: collapse; min-width: 760px; }}
-th, td {{ border-bottom: 1px solid var(--line); padding: 9px 10px; text-align: left; vertical-align: top; font-size: 13px; }}
-th {{ position: sticky; top: 0; background: var(--thead); z-index: 1; white-space: nowrap; }}
-tbody tr:nth-child(even) {{ background: #fbfdff; }}
-td {{ word-break: break-word; }}
-.muted {{ color: var(--muted); }}
-.badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; white-space: nowrap; }}
-.badge-critical {{ color: var(--critical); background: var(--critical-bg); }}
-.badge-high {{ color: var(--high); background: var(--high-bg); }}
-.badge-medium {{ color: var(--medium); background: var(--medium-bg); }}
-.badge-low {{ color: var(--low); background: var(--low-bg); }}
-.badge-info {{ color: var(--info); background: var(--info-bg); }}
-.two-col {{ display: grid; grid-template-columns: 1.2fr 1fr; gap: 18px; }}
-.callout {{ border-radius: 12px; padding: 12px 14px; margin-bottom: 16px; border: 1px solid var(--line); }}
-.callout.warning {{ background: #fff7ed; border-color: #fdba74; }}
-details summary {{ cursor: pointer; color: var(--muted); margin-bottom: 10px; }}
-.footer {{ color: var(--muted); font-size: 12px; margin-top: 10px; }}
-@media (max-width: 980px) {{
-  .two-col {{ grid-template-columns: 1fr; }}
-  .container {{ padding: 14px; }}
-  .metric .value {{ font-size: 24px; }}
-}}
-@media print {{
-  body {{ background: #fff; }}
-  .nav {{ display: none; }}
-  .card {{ box-shadow: none; break-inside: avoid; }}
-  th {{ position: static; }}
-}}
+body {{ font-family: Arial, Helvetica, sans-serif; margin: 24px; color: #1f2937; }}
+h1, h2 {{ margin-bottom: 8px; }}
+.card {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 16px; margin-bottom: 18px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
+.metric {{ border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; background: #f9fafb; }}
+.metric .label {{ font-size: 12px; color: #6b7280; }}
+.metric .value {{ font-size: 24px; font-weight: 700; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
+th, td {{ border: 1px solid #e5e7eb; padding: 8px; text-align: left; vertical-align: top; font-size: 13px; }}
+th {{ background: #f3f4f6; }}
+.muted {{ color: #6b7280; }}
 </style>
 </head>
 <body>
-<div class='container'>
-  <div class='header'>
-    <div>
-      <h1>OCI Compute Health Check Audit</h1>
-      <div class='header-meta'>Generated at {html.escape(report['generated_at_utc'])}</div>
-      <div class='header-meta'>Project: {html.escape(str(report.get('project', 'oci_compute_health_check_audit')))} · Script: {html.escape(str(report.get('script', 'oci_compute_audit.py')))}</div>
-    </div>
-    <div class='header-meta'>
-      <div>Instances audited: <strong>{summary.get('instance_count', 0)}</strong></div>
-      <div>Errors: <strong>{summary.get('error_count', 0)}</strong></div>
-    </div>
-  </div>
-
-  <div class='nav'>
-    <a href='#overview'>Overview</a>
-    <a href='#config'>Run config</a>
-    <a href='#risk'>Highest risk</a>
-    <a href='#findings'>Findings</a>
-    <a href='#instances'>Instances</a>
-    <a href='#errors'>Errors</a>
-  </div>
-
-  {empty_hint}
-
-  <section id='overview' class='card'>
-    <h2>Overview</h2>
-    <div class='grid'>
-      {metric_card('Instances', summary.get('instance_count', 0), 'Compute instances successfully audited')}
-      {metric_card('Errors', summary.get('error_count', 0), 'Audit exceptions recorded')}
-      {metric_card('Public IP instances', summary.get('public_ip_instance_count', 0), 'Primary VNIC has a public IP')}
-      {metric_card('Security zone instances', summary.get('security_zone_instance_count', 0), 'In or under a Security Zone compartment')}
-      {metric_card('OSMH unmanaged', summary.get('unmanaged_osmh_instance_count', 0), 'Not seen by OS Management Hub')}
-      {metric_card('VSS coverage missing', summary.get('vss_missing_count', 0), 'No vulnerability scanning target resolved')}
-    </div>
-  </section>
-
-  <div class='two-col'>
-    <section id='config' class='card'>
-      <h2>Run configuration</h2>
-      <div class='table-wrap'>{html_table(['Setting', 'Value'], config_rows)}</div>
-    </section>
-
-    <section class='card'>
-      <h2>Summary breakdowns</h2>
-      <h3>Severity counts</h3>
-      <div class='table-wrap'>{html_table(['Severity', 'Count'], sev_counts)}</div>
-      <h3 style='margin-top:14px;'>Top finding codes</h3>
-      <div class='table-wrap'>{html_table(['Finding code', 'Count'], top_codes)}</div>
-      <h3 style='margin-top:14px;'>Capacity types</h3>
-      <div class='table-wrap'>{html_table(['Capacity type', 'Count'], cap_counts)}</div>
-      <h3 style='margin-top:14px;'>Utilization recommendations</h3>
-      <div class='table-wrap'>{html_table(['Recommendation', 'Count'], util_counts)}</div>
-    </section>
-  </div>
-
-  <section id='risk' class='card'>
-    <h2>Highest-risk instances</h2>
-    <p class='muted'>Top 50 instances by computed risk score.</p>
-    <div class='table-wrap'>{html_table(['Region', 'Compartment', 'Instance', 'Shape', 'Highest severity', 'Risk score', 'Utilization', 'Top findings'], critical_rows)}</div>
-  </section>
-
-  <section id='findings' class='card'>
-    <h2>Findings sample</h2>
-    <p class='muted'>First 250 findings in report order. Use JSON output for the full structured dataset.</p>
-    <div class='table-wrap'>{html_table(['Severity', 'Category', 'Code', 'Instance', 'Message'], finding_rows)}</div>
-  </section>
-
-  <section id='instances' class='card'>
-    <h2>Instance summary</h2>
-    <p class='muted'>Top 200 instances sorted by severity and risk score.</p>
-    <div class='table-wrap'>{html_table(['Region', 'Compartment', 'Instance', 'State', 'Shape', 'Private IP', 'Public IP', 'Security Zone', 'Instance Pool', 'CPU avg %', 'Memory avg %', 'Highest severity'], instance_rows)}</div>
-    <details>
-      <summary>Why only a subset is shown here?</summary>
-      <p>The HTML report is meant to stay readable. The JSON and CSV outputs contain the complete audit result set.</p>
-    </details>
-  </section>
-
-  <section id='errors' class='card'>
-    <h2>Errors</h2>
-    <div class='table-wrap'>{html_table(['Region', 'Compartment', 'Instance', 'Error'], error_rows)}</div>
-  </section>
-
-  <div class='footer'>Generated by oci_compute_health_check_audit. For full fidelity and machine-readable details, review the accompanying JSON output.</div>
+<h1>OCI Compute Health Check Audit</h1>
+<p class='muted'>Generated at {html.escape(report['generated_at_utc'])}</p>
+<div class='grid'>
+  <div class='metric'><div class='label'>Instances</div><div class='value'>{summary.get('instance_count', 0)}</div></div>
+  <div class='metric'><div class='label'>Errors</div><div class='value'>{summary.get('error_count', 0)}</div></div>
+  <div class='metric'><div class='label'>Public IP instances</div><div class='value'>{summary.get('public_ip_instance_count', 0)}</div></div>
+  <div class='metric'><div class='label'>Security zone instances</div><div class='value'>{summary.get('security_zone_instance_count', 0)}</div></div>
+  <div class='metric'><div class='label'>OSMH unmanaged</div><div class='value'>{summary.get('unmanaged_osmh_instance_count', 0)}</div></div>
+  <div class='metric'><div class='label'>VSS coverage missing</div><div class='value'>{summary.get('vss_missing_count', 0)}</div></div>
+  <div class='metric'><div class='label'>Windows/Linux image types</div><div class='value'>{len(summary.get('image_type_counts', {}))}</div></div>
 </div>
+<div class='card'><h2>Severity counts</h2>{html_table(['Severity','Count'], sev_counts)}</div>
+<div class='card'><h2>Top finding codes</h2>{html_table(['Finding code','Count'], top_codes)}</div>
+<div class='card'><h2>Capacity types</h2>{html_table(['Capacity type','Count'], cap_counts)}</div>
+<div class='card'><h2>Image types</h2>{html_table(['Image type','Count'], image_counts)}</div>
+<div class='card'><h2>Utilization recommendations</h2>{html_table(['Recommendation','Count'], util_counts)}</div>
+<div class='card'><h2>Highest-risk instances</h2>{html_table(['Region','Compartment','Instance','Shape','Highest severity','Risk score','Top findings'], critical_rows)}</div>
+<div class='card'><h2>Findings sample</h2>{html_table(['Severity','Code','Instance','Message'], finding_rows)}</div>
+<div class='card'><h2>Errors</h2>{html_table(['Region','Instance','Error'], error_rows)}</div>
 </body>
 </html>
 """
@@ -1387,6 +1292,8 @@ def write_outputs(report: Dict[str, Any], output_dir: Path, output_prefix: str) 
         "instance_name",
         "state",
         "shape",
+        "image_type",
+        "image_operating_system",
         "availability_domain",
         "fault_domain",
         "capacity_type",
@@ -1436,7 +1343,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--region")
     p.add_argument("--region-list", help="Comma-separated region names.")
     p.add_argument("--all-regions", action="store_true")
-    p.add_argument("--compartment-id")
+    p.add_argument("--compartment-id", help="Compartment OCID to audit. By default this includes active child compartments too.")
+    p.add_argument("--direct-compartment-only", action="store_true", help="Audit only the exact compartment passed in --compartment-id, without child compartments.")
     p.add_argument("--output-dir", default=".")
     p.add_argument("--output-prefix", default="oci_compute_health_check_audit")
     p.add_argument("--active-only", action="store_true")
@@ -1447,6 +1355,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--disable-osmh", action="store_true")
     p.add_argument("--disable-vss", action="store_true")
     p.add_argument("--policy-file", help="YAML or JSON file with severity overrides and thresholds.")
+    p.add_argument("--quiet-progress", action="store_true", help="Suppress live progress logs on stderr, including running-command heartbeat messages.")
     p.add_argument("--verbose", action="store_true")
     return p
 
@@ -1460,6 +1369,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         paths = write_outputs(report, Path(args.output_dir), args.output_prefix)
         summary = report["summary"]
         print("=== OCI Compute Health Check Audit ===")
+        print(f"Regions scanned    : {', '.join(audit.regions)}")
+        print(f"Compartment scope  : {len(audit.compartments)} compartment(s)")
         print(f"Instances audited : {summary['instance_count']}")
         print(f"Errors            : {summary['error_count']}")
         print(f"Severity counts   : {summary['severity_counts']}")
